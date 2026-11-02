@@ -17,7 +17,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
 # ───────────────────────── НАСТРОЙКИ ─────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_СЮДА")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8983213961:AAEHUGA1pqoTXvFigXZt3Ds3YBHItd70L6I")
 ADMIN_USERNAME = "ruxdev"          # без @
 ADMIN_IDS: set[int] = set()        # (необязательно) можно добавить ID админа для надёжности
 DB_PATH = "bot.db"
