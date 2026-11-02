@@ -1,7 +1,3 @@
-Scripts Agent — Telegram-бот каталога скриптов для Roblox.
-Установка:  pip install -U aiogram aiosqlite
-Запуск:     BOT_TOKEN=123:ABC python bot.py
-"""
 import asyncio
 import logging
 import os
