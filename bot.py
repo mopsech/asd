@@ -1,3 +1,7 @@
+Scripts Agent — Telegram-бот каталога скриптов для Roblox.
+Установка:  pip install -U aiogram aiosqlite
+Запуск:     BOT_TOKEN=123:ABC python bot.py
+"""
 import asyncio
 import logging
 import os
@@ -17,10 +21,21 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
 # ───────────────────────── НАСТРОЙКИ ─────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8983213961:AAEHUGA1pqoTXvFigXZt3Ds3YBHItd70L6I")
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # токен задаётся в «Переменных окружения» хоста, не в коде!
+if not BOT_TOKEN:
+    raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 ADMIN_USERNAME = "ruxdev"          # без @
 ADMIN_IDS: set[int] = set()        # (необязательно) можно добавить ID админа для надёжности
-DB_PATH = "bot.db"
+# База лежит в постоянной папке данных (на хосте это /app/data), чтобы не пропадать при пересборке
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except OSError:
+    DATA_DIR = "."
+DB_PATH = os.path.join(DATA_DIR, "bot.db")
+if not os.path.exists(DB_PATH) and os.path.exists("bot.db"):  # перенос старой базы, если она есть
+    import shutil
+    shutil.copy("bot.db", DB_PATH)
 START_IMAGE_FILE = "start.jpg"     # запасной способ: положи картинку рядом с bot.py
 PER_PAGE = 8
 
