@@ -54,6 +54,10 @@ START_IMAGE_FILE = "start.jpg"  # запасной способ задать к�
 PER_PAGE = 8        # скриптов на странице
 CATS_PER_PAGE = 10  # категорий на странице
 TOP_DAYS = 7        # за сколько дней считается «Топ»
+COMMENTS_PER_PAGE = 5     # комментариев на странице
+COMMENT_MAX = 500         # максимум символов в комментарии
+COMMENT_COOLDOWN = 20     # секунд между комментариями одного человека
+POST_STYLES = {"": "обычная", "primary": "синяя", "success": "зелёная", "danger": "красная"}
 
 DEFAULTS = {
     "start_text": "<b>Scripts Agent</b> - Твой каталог скриптов для Roblox без подписок на множество каналов!\n\nНачинай прямо сейчас.",
@@ -66,6 +70,7 @@ DEFAULTS = {
     "search_prompt": "Введите название скрипта или игры:",
     "sub_text": "Чтобы получить этот скрипт, подпишитесь на каналы ниже и нажмите «Проверить подписку».",
     "banned_text": "Вы заблокированы в этом боте.",
+    "post_btn_text": "Открыть бота",
 }
 HTML_KEYS = {"start_text", "support_text", "search_prompt", "sub_text", "banned_text"}
 LABELS = {
@@ -75,6 +80,7 @@ LABELS = {
     "support_text": "Текст поддержки", "support_url": "Ссылка поддержки (@user или URL)",
     "search_prompt": "Текст поиска", "sub_text": "Текст обязательной подписки",
     "banned_text": "Текст для забаненных", "post_channel": "Канал для постов (@канал или ID)",
+    "post_btn_text": "Текст кнопки под постом",
 }
 # Картинки вкладок (экранов бота)
 PHOTO_KEYS = {
@@ -99,6 +105,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, kind TEXT, ts INTEGER, script_id INTEGER);
 CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, username TEXT, level INTEGER NOT NULL, added INTEGER);
 CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER, script_id INTEGER, created INTEGER, PRIMARY KEY(user_id, script_id));
+CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, script_id INTEGER, value INTEGER, PRIMARY KEY(user_id, script_id));
+CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY AUTOINCREMENT, script_id INTEGER, user_id INTEGER, username TEXT, name TEXT, text TEXT, created INTEGER);
 """
 
 dirty = False            # были ли изменения с последнего бэкапа
@@ -132,7 +140,7 @@ async def run(sql, args=()):
     if "into events" not in low and "views=views+1" not in low:
         dirty = True
         # важные изменения (не просто активность пользователей) -> бэкап через 30 секунд
-        if "into users" not in low and "favorites" not in low:
+        if not any(k in low for k in ("into users", "favorites", "votes", "comments")):
             schedule_backup(30)
     return cur.lastrowid
 
@@ -510,6 +518,10 @@ class AdminAdd(StatesGroup):
     target = State()
 
 
+class Comment(StatesGroup):
+    text = State()
+
+
 # ───────────────────────── РОУТЕРЫ ─────────────────────────
 cmd_router = Router()
 owner = Router()   # только владелец: выдача админок
@@ -794,11 +806,20 @@ def back_for(src: str, category_id) -> str:
 
 
 async def script_keyboard(bot: Bot, s, src: str, user_id: int):
-    fav = bool(await fetchone("SELECT 1 FROM favorites WHERE user_id=? AND script_id=?", (user_id, s["id"])))
+    sid = s["id"]
+    fav = bool(await fetchone("SELECT 1 FROM favorites WHERE user_id=? AND script_id=?", (user_id, sid)))
+    v = await fetchone("SELECT COALESCE(SUM(value=1),0) up, COALESCE(SUM(value=-1),0) down FROM votes WHERE script_id=?", (sid,))
+    mine = await fetchone("SELECT value FROM votes WHERE user_id=? AND script_id=?", (user_id, sid))
+    n_comments = (await fetchone("SELECT COUNT(*) n FROM comments WHERE script_id=?", (sid,)))["n"]
     link = await script_link(bot, s["token"])
     share = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(f"{s['title']} - скрипт для Roblox")
+    up, down = v["up"], v["down"]
+    mv = mine["value"] if mine else 0
     return kb([
-        [btn("Убрать из избранного" if fav else "В избранное", f"fav:{s['id']}:{src}")],
+        [btn(f"👍 {up}" if up else "👍", f"vote:{sid}:u:{src}", style="success" if mv == 1 else None),
+         btn(f"👎 {down}" if down else "👎", f"vote:{sid}:d:{src}", style="danger" if mv == -1 else None)],
+        [btn(f"Комментарии ({n_comments})" if n_comments else "Комментарии", f"cmo:{sid}")],
+        [btn("Убрать из избранного" if fav else "В избранное", f"fav:{sid}:{src}")],
         [ub("Поделиться скриптом", share)],
         [btn("Назад", back_for(src, s["category_id"]))],
     ])
@@ -832,32 +853,34 @@ async def open_script(msg: Message, user_id: int, sid: int, src: str = "c", cb: 
     await run("UPDATE scripts SET views=views+1 WHERE id=?", (sid,))
     await run("INSERT INTO events(user_id,kind,ts,script_id) VALUES(?,?,?,?)", (user_id, "view", int(time.time()), sid))
 
-    head = f"<b>{esc(s['title'])}</b>"
-    if s["description"]:
-        head += f"\n\n{esc(s['description'])}"
+    title, desc = s["title"], s["description"] or ""
     content = s["content"] or ""
     photo = s["photo"]
-    caption_ok = len(head) <= 1024
+    head = f"<b>{esc(title)}</b>" + (f"\n\n{esc(desc)}" if desc else "")
+    code_html = f"<pre>{esc(content)}</pre>" if content else ""
+    # длина «видимого» текста (Telegram считает подпись к фото без тегов): лимит подписи 1024
+    head_len = len(title) + (2 + len(desc) if desc else 0)
+    full_len = head_len + (2 + len(content) if content else 0)
 
-    code_text, as_file = "", None
-    if content:
-        if len(head) + len(content) < 3800:
-            code_text = f"<pre>{esc(content)}</pre>"
-        else:
-            as_file = BufferedInputFile(content.encode("utf-8"), filename="script.lua")
-
-    senders = []
-    if photo:
-        if caption_ok:
-            senders.append(lambda mk: msg.answer_photo(photo, caption=head, reply_markup=mk))
-            body = code_text
-        else:
-            senders.append(lambda mk: msg.answer_photo(photo, reply_markup=mk))
-            body = head + (("\n\n" + code_text) if code_text else "")
+    senders, as_file = [], None
+    if photo and full_len <= 1024:
+        # всё помещается в подпись: картинка, название, описание и код в ОДНОМ сообщении
+        full_html = head + (("\n\n" + code_html) if code_html else "")
+        senders.append(lambda mk: msg.answer_photo(photo, caption=full_html, reply_markup=mk))
     else:
-        body = head + (("\n\n" + code_text) if code_text else "")
-    if body:
-        senders.append(lambda mk: msg.answer(body, reply_markup=mk))
+        code_inline = bool(content) and full_len < 3800
+        if content and not code_inline:
+            as_file = BufferedInputFile(content.encode("utf-8"), filename="script.lua")
+        if photo and head_len <= 1024:
+            senders.append(lambda mk: msg.answer_photo(photo, caption=head, reply_markup=mk))
+            body = code_html if code_inline else ""
+        elif photo:
+            senders.append(lambda mk: msg.answer_photo(photo, reply_markup=mk))
+            body = head + (("\n\n" + code_html) if code_inline else "")
+        else:
+            body = head + (("\n\n" + code_html) if code_inline else "")
+        if body:
+            senders.append(lambda mk: msg.answer(body, reply_markup=mk))
     if as_file:
         senders.append(lambda mk: msg.answer_document(as_file, reply_markup=mk))
     if s["file_id"]:
@@ -867,6 +890,142 @@ async def open_script(msg: Message, user_id: int, sid: int, src: str = "c", cb: 
         await send(markup if i == len(senders) - 1 else None)  # кнопки — на последнем сообщении
     if cb:
         await cb.answer()
+
+
+# ───── Лайки / дизлайки ─────
+@user.callback_query(F.data.regexp(r"^vote:\d+:[ud]:[cft]$"))
+async def cb_vote(cb: CallbackQuery):
+    _, sid, kind, src = cb.data.split(":")
+    sid, val = int(sid), (1 if kind == "u" else -1)
+    s = await fetchone("SELECT * FROM scripts WHERE id=?", (sid,))
+    if not s:
+        return await cb.answer("Скрипт не найден", show_alert=True)
+    uid = cb.from_user.id
+    cur = await fetchone("SELECT value FROM votes WHERE user_id=? AND script_id=?", (uid, sid))
+    if cur and cur["value"] == val:
+        await run("DELETE FROM votes WHERE user_id=? AND script_id=?", (uid, sid))
+        note = "Оценка снята"
+    else:
+        await run("INSERT INTO votes(user_id,script_id,value) VALUES(?,?,?) "
+                  "ON CONFLICT(user_id,script_id) DO UPDATE SET value=excluded.value", (uid, sid, val))
+        note = "Спасибо за оценку"
+    try:
+        await cb.message.edit_reply_markup(reply_markup=await script_keyboard(cb.bot, s, src, uid))
+    except Exception:
+        pass
+    await cb.answer(note)
+
+
+# ───── Комментарии ─────
+def fmt_date(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+
+
+async def render_comments(sid: int, page: int, can_delete: bool):
+    s = await fetchone("SELECT title FROM scripts WHERE id=?", (sid,))
+    if not s:
+        return None, None
+    items = await fetchall("SELECT * FROM comments WHERE script_id=? ORDER BY id DESC", (sid,))
+    pages = max(1, -(-len(items) // COMMENTS_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    chunk = items[page * COMMENTS_PER_PAGE:(page + 1) * COMMENTS_PER_PAGE]
+    lines = [f"<b>{esc(c['name'] or 'Пользователь')}</b>, {fmt_date(c['created'])}\n{esc(c['text'])}" for c in chunk]
+    text = (f"<b>Комментарии: {esc(s['title'])}</b>\nВсего: {len(items)}\n\n"
+            + ("\n\n".join(lines) if lines else "Пока нет комментариев. Будьте первым."))
+    rows = []
+    if can_delete:
+        rows += [[btn(f"Удалить #{c['id']} ({(c['name'] or '')[:15]})", f"cmd:{c['id']}:{sid}:{page}", style="danger")] for c in chunk]
+    rows.append([btn("Написать комментарий", f"cmw:{sid}", style="primary")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("‹", f"cmp:{sid}:{page - 1}"))
+        nav.append(btn(f"{page + 1}/{pages}", "noop"))
+        if page < pages - 1:
+            nav.append(btn("›", f"cmp:{sid}:{page + 1}"))
+        rows.append(nav)
+    rows.append([btn("Закрыть", "cmx")])
+    return text, kb(rows)
+
+
+@user.callback_query(F.data.regexp(r"^cmo:\d+$"))
+async def cb_comments_open(cb: CallbackQuery):
+    """Комментарии открываются НОВЫМ сообщением, чтобы скрипт выше остался на месте."""
+    sid = int(cb.data.split(":")[1])
+    text, markup = await render_comments(sid, 0, await get_level(cb.from_user) >= 3)
+    if text is None:
+        return await cb.answer("Скрипт не найден", show_alert=True)
+    await cb.message.answer(text, reply_markup=markup)
+    await cb.answer()
+
+
+@user.callback_query(F.data.regexp(r"^cmp:\d+:\d+$"))
+async def cb_comments_page(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, sid, page = cb.data.split(":")
+    text, markup = await render_comments(int(sid), int(page), await get_level(cb.from_user) >= 3)
+    if text is None:
+        return await cb.answer("Скрипт не найден", show_alert=True)
+    await show(cb, text, markup)
+    await cb.answer()
+
+
+@user.callback_query(F.data == "cmx")
+async def cb_comments_close(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@user.callback_query(F.data.regexp(r"^cmw:\d+$"))
+async def cb_comment_write(cb: CallbackQuery, state: FSMContext):
+    sid = int(cb.data.split(":")[1])
+    await state.set_state(Comment.text)
+    await state.update_data(sid=sid, pmid=cb.message.message_id)
+    await show(cb, f"Напишите комментарий одним сообщением (до {COMMENT_MAX} символов).",
+               kb([[btn("Отмена", f"cmp:{sid}:0")]]))
+    await cb.answer()
+
+
+@user.message(Comment.text, F.text)
+async def comment_save(m: Message, state: FSMContext):
+    d = await state.get_data()
+    sid = d.get("sid")
+    text = m.text.strip()
+    if not sid or not text:
+        return
+    staff = await get_level(m.from_user) > 0
+    if len(text) > COMMENT_MAX:
+        return await m.answer(f"Слишком длинно: максимум {COMMENT_MAX} символов, у вас {len(text)}. Сократите и отправьте снова.")
+    low = text.lower()
+    if not staff and any(k in low for k in ("http", "t.me", "www.")):
+        return await m.answer("Ссылки в комментариях запрещены. Напишите комментарий без ссылок.")
+    now = int(time.time())
+    last = await fetchone("SELECT MAX(created) t FROM comments WHERE user_id=?", (m.from_user.id,))
+    if last and last["t"] and now - last["t"] < COMMENT_COOLDOWN:
+        return await m.answer("Подождите немного перед следующим комментарием.")
+    if not await fetchone("SELECT 1 FROM scripts WHERE id=?", (sid,)):
+        await state.clear()
+        return await m.answer("Скрипт уже удалён.")
+    name = (m.from_user.first_name or "Пользователь")[:30]
+    await run("INSERT INTO comments(script_id,user_id,username,name,text,created) VALUES(?,?,?,?,?,?)",
+              (sid, m.from_user.id, m.from_user.username, name, text, now))
+    await state.clear()
+    if d.get("pmid"):
+        try:
+            await m.bot.delete_message(m.chat.id, d["pmid"])
+        except Exception:
+            pass
+    out, markup = await render_comments(sid, 0, staff and await get_level(m.from_user) >= 3)
+    await m.answer(out, reply_markup=markup)
+
+
+@user.message(Comment.text)
+async def comment_not_text(m: Message):
+    await m.answer("Комментарий нужно отправить текстом.")
 
 
 @user.callback_query(F.data.regexp(r"^(scr|scf|sct):\d+$"))
@@ -1183,12 +1342,16 @@ async def adm_stats(cb: CallbackQuery):
     searches = await n("SELECT COUNT(*) n FROM events WHERE kind='search'")
     views = await n("SELECT COUNT(*) n FROM events WHERE kind='view'")
     favs = await n("SELECT COUNT(*) n FROM favorites")
+    likes = await n("SELECT COUNT(*) n FROM votes WHERE value=1")
+    dislikes = await n("SELECT COUNT(*) n FROM votes WHERE value=-1")
+    n_comments = await n("SELECT COUNT(*) n FROM comments")
     top = await fetchall("SELECT title,views FROM scripts ORDER BY views DESC LIMIT 5")
     top_txt = "\n".join(f"{i}. {esc(t['title'])} - {t['views']}" for i, t in enumerate(top, 1)) or "-"
     text = (f"<b>Активность</b>\n\nВсего пользователей: {total}\nНовых за 24ч: {new1}\n"
             f"Активных за 24ч: {d1}\nАктивных за 7 дней: {d7}\nЗабанено: {banned}\n\n"
             f"Категорий: {cats}\nСкриптов: {scr}\nПоисков: {searches}\nОткрытий скриптов: {views}\n"
-            f"В избранном: {favs}\n\n<b>Топ скриптов:</b>\n{top_txt}")
+            f"В избранном: {favs}\nЛайков: {likes}, дизлайков: {dislikes}\nКомментариев: {n_comments}\n\n"
+            f"<b>Топ скриптов:</b>\n{top_txt}")
     await show(cb, text, kb([[btn("Обновить", "adm_stats")], [btn("Назад", "adm")]]))
     await cb.answer()
 
@@ -1332,6 +1495,8 @@ async def acat_del(cb: CallbackQuery):
 async def acat_del_yes(cb: CallbackQuery):
     cid = int(cb.data.split(":")[1])
     await run("DELETE FROM favorites WHERE script_id IN (SELECT id FROM scripts WHERE category_id=?)", (cid,))
+    await run("DELETE FROM votes WHERE script_id IN (SELECT id FROM scripts WHERE category_id=?)", (cid,))
+    await run("DELETE FROM comments WHERE script_id IN (SELECT id FROM scripts WHERE category_id=?)", (cid,))
     await run("DELETE FROM scripts WHERE category_id=?", (cid,))
     await run("DELETE FROM categories WHERE id=?", (cid,))
     await cb.answer("Удалено")
@@ -1462,27 +1627,104 @@ async def ascr_del(cb: CallbackQuery):
     sid = int(cb.data.split(":")[1])
     s = await fetchone("SELECT category_id FROM scripts WHERE id=?", (sid,))
     await run("DELETE FROM favorites WHERE script_id=?", (sid,))
+    await run("DELETE FROM votes WHERE script_id=?", (sid,))
+    await run("DELETE FROM comments WHERE script_id=?", (sid,))
     await run("DELETE FROM scripts WHERE id=?", (sid,))
     await cb.answer("Удалено")
     if s:
         await scripts_in_cat(cb, s["category_id"])
 
 
-# — пост и рассылка —
+# — удаление комментариев (модерация) —
+@adm3.callback_query(F.data.regexp(r"^cmd:\d+:\d+:\d+$"))
+async def comment_delete(cb: CallbackQuery):
+    _, cid, sid, page = cb.data.split(":")
+    await run("DELETE FROM comments WHERE id=?", (int(cid),))
+    text, markup = await render_comments(int(sid), int(page), True)
+    if text is None:
+        return await cb.answer("Скрипт не найден", show_alert=True)
+    await show(cb, text, markup)
+    await cb.answer("Комментарий удалён")
+
+
+# — пост в канал —
+def post_markup(text: str, style: str, username: str):
+    return kb([[ub(text or "Открыть бота", f"https://t.me/{username}", style=style or None)]])
+
+
+async def current_post_markup(bot: Bot):
+    me = await bot.me()
+    return post_markup(await get_setting("post_btn_text"), await get_setting("post_btn_style"), me.username)
+
+
+async def post_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    ch = await get_setting("post_channel")
+    style = await get_setting("post_btn_style")
+    text = ("<b>Пост в канал</b>\n\n"
+            f"Канал: {esc(ch) if ch else 'не указан'}\n"
+            f"Текст кнопки: {esc(await get_setting('post_btn_text'))}\n"
+            f"Цвет кнопки: {POST_STYLES.get(style, 'обычная')}")
+    await show(cb, text, kb([
+        [btn("Создать пост", "post_new", style="success")],
+        [btn("Текст кнопки", "aset:post_btn_text"), btn("Цвет кнопки", "post_color")],
+        [btn("Посмотреть кнопку", "post_prev")],
+        [btn("Канал для постов", "aset:post_channel")],
+        [btn("Назад", "adm")]]))
+
+
 @adm3.callback_query(F.data == "adm_post")
 async def adm_post(cb: CallbackQuery, state: FSMContext):
+    await post_menu(cb, state)
+    await cb.answer()
+
+
+@adm3.callback_query(F.data == "post_color")
+async def post_color(cb: CallbackQuery):
+    cur = await get_setting("post_btn_style")
+
+    def label(key, name):
+        return name + (" (выбрано)" if cur == key else "")
+
+    await show(cb, "Выберите цвет кнопки под постом:", kb([
+        [btn(label("", "Обычная"), "pstyle:none")],
+        [btn(label("primary", "Синяя"), "pstyle:primary", style="primary")],
+        [btn(label("success", "Зелёная"), "pstyle:success", style="success")],
+        [btn(label("danger", "Красная"), "pstyle:danger", style="danger")],
+        [btn("Назад", "adm_post")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^pstyle:(none|primary|success|danger)$"))
+async def post_style_set(cb: CallbackQuery, state: FSMContext):
+    val = cb.data.split(":")[1]
+    await set_setting("post_btn_style", "" if val == "none" else val)
+    await post_menu(cb, state)
+    await cb.answer("Цвет сохранён")
+
+
+@adm3.callback_query(F.data == "post_prev")
+async def post_prev(cb: CallbackQuery):
+    await cb.message.answer("Так выглядит кнопка под постом:", reply_markup=await current_post_markup(cb.bot))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data == "post_new")
+async def post_new(cb: CallbackQuery, state: FSMContext):
     ch = await get_setting("post_channel")
     if not ch:
-        await show(cb, "Сначала укажите канал для постов: Тексты → «Канал для постов».\n"
-                       "Бот должен быть админом канала.", kb([[btn("Назад", "adm")]]))
-        return await cb.answer()
-    await ask(cb, state, PostS.msg, f"Отправьте пост (текст/фото/видео), он уйдёт в {esc(ch)} с кнопкой «Открыть бота»:")
+        return await cb.answer("Сначала укажите канал для постов", show_alert=True)
+    await ask(cb, state, PostS.msg, f"Отправьте пост (текст/фото/видео), он уйдёт в {esc(ch)} с кнопкой под ним:")
 
 
 @adm3.message(PostS.msg)
 async def post_preview(m: Message, state: FSMContext):
     await state.update_data(mid=m.message_id, cid=m.chat.id)
-    await m.answer("Так будет выглядеть пост. Опубликовать?", reply_markup=kb([
+    try:  # предпросмотр: тот же пост, уже с кнопкой нужного текста и цвета
+        await m.bot.copy_message(m.chat.id, m.chat.id, m.message_id, reply_markup=await current_post_markup(m.bot))
+    except Exception:
+        pass
+    await m.answer("Выше предпросмотр поста с кнопкой. Опубликовать?", reply_markup=kb([
         [btn("Опубликовать", "post_go", style="success"), btn("Отмена", "adm", style="danger")]]))
 
 
@@ -1491,15 +1733,14 @@ async def post_go(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
     if "mid" not in d:
         return await cb.answer()
-    me = await cb.bot.me()
     try:
         await cb.bot.copy_message(chat_ref(await get_setting("post_channel")), d["cid"], d["mid"],
-                                  reply_markup=kb([[ub("Открыть бота", f"https://t.me/{me.username}")]]))
+                                  reply_markup=await current_post_markup(cb.bot))
         res = "Пост опубликован."
     except Exception as e:
         res = f"Ошибка: {esc(str(e))}"
     await state.clear()
-    await show(cb, res, kb([[btn("В админку", "adm")]]))
+    await show(cb, res, kb([[btn("К настройкам поста", "adm_post")], [btn("В админку", "adm")]]))
     await cb.answer()
 
 
@@ -1664,7 +1905,8 @@ async def edit_value(m: Message, state: FSMContext):
             val = "https://t.me/" + val[1:]
     await set_setting(key, val)
     await state.clear()
-    await m.answer("Сохранено", reply_markup=await akb(m.from_user))
+    back = kb([[btn("К настройкам поста", "adm_post")]]) if key.startswith("post_") else await akb(m.from_user)
+    await m.answer("Сохранено", reply_markup=back)
 
 
 # — обязательная подписка (каналы) —
