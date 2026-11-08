@@ -5,11 +5,13 @@
 import asyncio
 import logging
 import os
+import random
+import re
 import shutil
 import time
 import uuid
-from datetime import datetime
-from html import escape as esc
+from datetime import datetime, timedelta, timezone
+from html import escape as esc, unescape
 from io import BytesIO
 from urllib.parse import quote
 
@@ -24,7 +26,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile,
                            InlineKeyboardButton, InlineKeyboardMarkup,
-                           InputMediaPhoto, Message)
+                           InputMediaPhoto, LinkPreviewOptions, Message,
+                           ReplyParameters)
 
 # ───────────────────────── НАСТРОЙКИ ─────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -58,6 +61,9 @@ COMMENTS_PER_PAGE = 5     # комментариев на странице
 COMMENT_MAX = 500         # максимум символов в комментарии
 COMMENT_COOLDOWN = 20     # секунд между комментариями одного человека
 POST_STYLES = {"": "обычная", "primary": "синяя", "success": "зелёная", "danger": "красная"}
+TZ_OFFSET = int(os.getenv("TZ_OFFSET", "3"))  # часовой пояс для розыгрышей (3 = МСК)
+TZ = timezone(timedelta(hours=TZ_OFFSET))
+TZ_NAME = "МСК" if TZ_OFFSET == 3 else f"UTC{TZ_OFFSET:+d}"
 
 DEFAULTS = {
     "start_text": "<b>Scripts Agent</b> - Твой каталог скриптов для Roblox без подписок на множество каналов!\n\nНачинай прямо сейчас.",
@@ -106,6 +112,9 @@ CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id 
 CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, username TEXT, level INTEGER NOT NULL, added INTEGER);
 CREATE TABLE IF NOT EXISTS favorites(user_id INTEGER, script_id INTEGER, created INTEGER, PRIMARY KEY(user_id, script_id));
 CREATE TABLE IF NOT EXISTS votes(user_id INTEGER, script_id INTEGER, value INTEGER, PRIMARY KEY(user_id, script_id));
+CREATE TABLE IF NOT EXISTS giveaways(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT DEFAULT '', photo TEXT, winners INTEGER DEFAULT 1, end_ts INTEGER, status TEXT DEFAULT 'draft', channel TEXT, post_msg_id INTEGER, result_msg_id INTEGER, btn_text TEXT DEFAULT 'Участвовать', btn_style TEXT DEFAULT 'success', channels TEXT DEFAULT '', boost_channels TEXT DEFAULT '', min_boosts INTEGER DEFAULT 1, min_views INTEGER DEFAULT 0, extra TEXT DEFAULT '', show_count INTEGER DEFAULT 1, recheck INTEGER DEFAULT 1, no_staff INTEGER DEFAULT 1, win_text TEXT DEFAULT '', admin_id INTEGER, created INTEGER, started INTEGER, finished INTEGER, shown_count INTEGER DEFAULT -1);
+CREATE TABLE IF NOT EXISTS gw_users(giveaway_id INTEGER, user_id INTEGER, username TEXT, name TEXT, joined INTEGER, excluded INTEGER DEFAULT 0, PRIMARY KEY(giveaway_id, user_id));
+CREATE TABLE IF NOT EXISTS gw_winners(giveaway_id INTEGER, user_id INTEGER, place INTEGER, username TEXT, name TEXT, notified INTEGER DEFAULT 0, PRIMARY KEY(giveaway_id, user_id));
 CREATE TABLE IF NOT EXISTS comments(id INTEGER PRIMARY KEY AUTOINCREMENT, script_id INTEGER, user_id INTEGER, username TEXT, name TEXT, text TEXT, created INTEGER);
 """
 
@@ -140,7 +149,7 @@ async def run(sql, args=()):
     if "into events" not in low and "views=views+1" not in low:
         dirty = True
         # важные изменения (не просто активность пользователей) -> бэкап через 30 секунд
-        if not any(k in low for k in ("into users", "favorites", "votes", "comments")):
+        if not any(k in low for k in ("into users", "favorites", "votes", "comments", "gw_users")):
             schedule_backup(30)
     return cur.lastrowid
 
@@ -522,6 +531,10 @@ class Comment(StatesGroup):
     text = State()
 
 
+class GwEdit(StatesGroup):
+    value = State()
+
+
 # ───────────────────────── РОУТЕРЫ ─────────────────────────
 cmd_router = Router()
 owner = Router()   # только владелец: выдача админок
@@ -577,7 +590,7 @@ async def akb(user_obj):
     if lvl >= 3:
         rows += [
             [btn("Категории", "adm_cats"), btn("Пост в канал", "adm_post")],
-            [btn("Рассылка", "adm_bc")],
+            [btn("Рассылка", "adm_bc"), btn("Розыгрыши", "gw_list")],
             [btn("Бан", "adm_ban"), btn("Разбан", "adm_unban")],
             [btn("Дизайн", "adm_design"), btn("Картинки вкладок", "adm_imgs")],
             [btn("Тексты", "adm_texts"), btn("Обяз. подписка", "adm_subs")],
@@ -597,6 +610,9 @@ def panel_title(level: int) -> str:
 async def cmd_start_link(m: Message, command: CommandObject, state: FSMContext):
     await state.clear()
     token = (command.args or "").strip()
+    if token.startswith("gw_") and token[3:].isdigit():  # участие в розыгрыше
+        await join_flow(m, m.from_user, int(token[3:]))
+        return
     s = await fetchone("SELECT id FROM scripts WHERE token=?", (token,)) if token else None
     if not s:
         await send_start(m)
@@ -1957,6 +1973,1018 @@ async def ch_del(cb: CallbackQuery):
     await admin_subs(cb)
 
 
+# ═════════════════════════ РОЗЫГРЫШИ ═════════════════════════
+GW_STATUS = {"draft": "черновик", "active": "идёт", "finishing": "подведение итогов",
+             "finished": "завершён", "cancelled": "отменён"}
+GW_MAX_WINNERS = 100
+GW_PRESETS = [("1 час", 60), ("6 часов", 360), ("24 часа", 1440), ("3 дня", 4320), ("7 дней", 10080)]
+GW_LOOP_SECONDS = 30
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
+def fmt_ts(ts: int) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M") + f" {TZ_NAME}"
+
+
+def html_len(s: str) -> int:
+    """Длина «видимого» текста (Telegram считает подпись без тегов)."""
+    return len(unescape(re.sub(r"<[^>]+>", "", s)))
+
+
+def norm_channel(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return ""
+    m = re.match(r"https?://t\.me/([A-Za-z0-9_]+)/?$", v)
+    if m:
+        return "@" + m.group(1)
+    if v.lstrip("-").isdigit() or v.startswith("@"):
+        return v
+    return "@" + v
+
+
+def msg_link(channel: str, mid) -> str:
+    """Ссылка на сообщение в канале (для кнопки «Итоги»)."""
+    c = str(channel or "").strip()
+    if not mid:
+        return None
+    if c.startswith("@"):
+        return f"https://t.me/{c[1:]}/{mid}"
+    if c.startswith("-100") and c[4:].isdigit():
+        return f"https://t.me/c/{c[4:]}/{mid}"
+    return None
+
+
+def parse_dt(text: str):
+    """ДД.ММ.ГГГГ ЧЧ:ММ (или ДД.ММ ЧЧ:ММ) в часовом поясе TZ -> unix-время."""
+    text = text.strip()
+    for f in ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"):
+        try:
+            return int(datetime.strptime(text, f).replace(tzinfo=TZ).timestamp())
+        except ValueError:
+            pass
+    try:
+        dt = datetime.strptime(text, "%d.%m %H:%M")
+        return int(dt.replace(year=datetime.now(TZ).year, tzinfo=TZ).timestamp())
+    except ValueError:
+        return None
+
+
+def mention(u) -> str:
+    if u["username"]:
+        return f"@{esc(u['username'])}"
+    return f'<a href="tg://user?id={u["user_id"]}">{esc((u["name"] or "участник")[:40])}</a>'
+
+
+async def get_gw(gid: int):
+    return await fetchone("SELECT * FROM giveaways WHERE id=?", (gid,))
+
+
+async def gw_count(gid: int) -> int:
+    return (await fetchone("SELECT COUNT(*) n FROM gw_users WHERE giveaway_id=?", (gid,)))["n"]
+
+
+async def _gw_channels(csv_ids: str):
+    rows = []
+    for x in (csv_ids or "").split(","):
+        if x.strip().isdigit():
+            ch = await fetchone("SELECT * FROM channels WHERE id=?", (int(x),))
+            if ch:
+                rows.append(ch)
+    return rows
+
+
+async def gw_required(g):
+    """Каналы, на которые нужно подписаться (из списка «Обяз. подписка»)."""
+    return await _gw_channels(g["channels"])
+
+
+async def gw_boost_required(g):
+    """Каналы, которые нужно забустить."""
+    return await _gw_channels(g["boost_channels"])
+
+
+def boost_link(ch):
+    """Ссылка, по которой человек может забустить канал."""
+    m = re.match(r"https?://t\.me/([A-Za-z0-9_]{4,})/?$", ch["url"] or "")
+    if m:
+        return f"https://t.me/{m.group(1)}?boost"
+    cid = str(ch["chat_id"])
+    if cid.startswith("-100") and cid[4:].isdigit():
+        return f"https://t.me/boost?c={cid[4:]}"
+    if cid.startswith("@"):
+        return f"https://t.me/{cid[1:]}?boost"
+    return ch["url"]
+
+
+async def gw_boosts(bot: Bot, ch, user_id: int) -> int:
+    """Сколько действующих бустов канала сделал пользователь (боту нужны права админа в канале)."""
+    res = await bot.get_user_chat_boosts(chat_id=chat_ref(ch["chat_id"]), user_id=user_id)
+    n = 0
+    for b in res.boosts:
+        exp = b.expiration_date
+        ts = exp if isinstance(exp, (int, float)) else (exp.timestamp() if exp else None)
+        if ts is None or ts > time.time():
+            n += 1
+    return n
+
+
+async def gw_boost_missing(bot: Bot, user_id: int, req, need: int) -> list:
+    """Каналы из req, на которые у человека меньше нужного числа бустов. [(канал, сколько_есть)]"""
+    missing = []
+    for ch in req:
+        try:
+            have = await gw_boosts(bot, ch, user_id)
+            if have < need:
+                missing.append((ch, have))
+        except Exception as e:
+            logging.warning("Не могу проверить бусты канала %s: %s", ch["chat_id"], e)
+    return missing
+
+
+async def gw_render_post(g) -> str:
+    parts = [f"<b>{esc(g['title'])}</b>"]
+    if g["description"]:
+        parts.append(g["description"])
+    info = [f"Победителей: {g['winners']}"]
+    if g["status"] == "finished":
+        info.append("Розыгрыш завершён.")
+    elif g["status"] == "cancelled":
+        info.append("Розыгрыш отменён.")
+    else:
+        info.append(f"Итоги: {fmt_ts(g['end_ts'])}")
+    parts.append("\n".join(info))
+    if g["status"] in ("draft", "active", "finishing"):
+        conds = []
+        for ch in await gw_required(g):
+            conds.append(f'Подписаться на <a href="{esc(ch["url"], quote=True)}">{esc(ch["title"])}</a>' if ch["url"]
+                         else f"Подписаться на {esc(ch['title'])}")
+        need_b = g["min_boosts"] or 1
+        for ch in await gw_boost_required(g):
+            link = boost_link(ch)
+            name = f'<a href="{esc(link, quote=True)}">{esc(ch["title"])}</a>' if link else esc(ch["title"])
+            conds.append(f"Забустить канал {name}" + (f" (бустов: {need_b})" if need_b > 1 else ""))
+        if g["min_views"]:
+            conds.append(f"Открыть в боте минимум {g['min_views']} разных скриптов")
+        if g["extra"]:
+            conds.append(esc(g["extra"]))
+        if conds:
+            parts.append("<b>Условия участия:</b>\n" + "\n".join("• " + c for c in conds))
+    return "\n\n".join(parts)
+
+
+async def gw_post_kb(bot: Bot, g, results_url=None):
+    if g["status"] in ("finished", "cancelled"):
+        return kb([[ub("Итоги розыгрыша", results_url)]]) if results_url else None
+    me = await bot.me()
+    label = g["btn_text"] or "Участвовать"
+    if g["show_count"]:
+        label += f" ({await gw_count(g['id'])})"
+    return kb([[ub(label, f"https://t.me/{me.username}?start=gw_{g['id']}", style=g["btn_style"] or None)]])
+
+
+async def gw_send_post(bot: Bot, chat, g):
+    text = await gw_render_post(g)
+    markup = await gw_post_kb(bot, g)
+    if g["photo"]:
+        return await bot.send_photo(chat, g["photo"], caption=text, reply_markup=markup)
+    return await bot.send_message(chat, text, reply_markup=markup, link_preview_options=NO_PREVIEW)
+
+
+async def gw_edit_post(bot: Bot, g, markup):
+    """Обновляет пост розыгрыша в канале (текст/подпись и кнопку)."""
+    if not g["post_msg_id"] or not g["channel"]:
+        return
+    chat = chat_ref(g["channel"])
+    text = await gw_render_post(g)
+    try:
+        if g["photo"]:
+            await bot.edit_message_caption(chat_id=chat, message_id=g["post_msg_id"], caption=text, reply_markup=markup)
+        else:
+            await bot.edit_message_text(text, chat_id=chat, message_id=g["post_msg_id"], reply_markup=markup,
+                                        link_preview_options=NO_PREVIEW)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logging.warning("Не удалось обновить пост розыгрыша #%s: %s", g["id"], e)
+
+
+async def gw_refresh_post(bot: Bot, gid: int):
+    g = await get_gw(gid)
+    if g and g["status"] == "active":
+        await gw_edit_post(bot, g, await gw_post_kb(bot, g))
+
+
+# ───── проверка условий и выбор победителей ─────
+async def gw_missing(bot: Bot, user_id: int, req) -> list:
+    missing = []
+    for ch in req:
+        try:
+            m = await bot.get_chat_member(chat_ref(ch["chat_id"]), user_id)
+            if m.status in ("left", "kicked"):
+                missing.append(ch)
+        except Exception as e:
+            logging.warning("Не могу проверить канал %s: %s", ch["chat_id"], e)
+    return missing
+
+
+async def gw_views_done(user_id: int, g) -> int:
+    return (await fetchone(
+        "SELECT COUNT(DISTINCT script_id) n FROM events WHERE user_id=? AND kind='view' AND script_id IS NOT NULL AND ts>=?",
+        (user_id, g["started"] or g["created"] or 0)))["n"]
+
+
+async def gw_pick(bot: Bot, g, count: int, skip_ids: set):
+    """Случайно выбирает победителей: не забаненные, не админы (если включено), условия подписки ещё выполнены."""
+    users = await fetchall(
+        "SELECT gu.* FROM gw_users gu JOIN users u ON u.id=gu.user_id "
+        "WHERE gu.giveaway_id=? AND u.banned=0 AND gu.excluded=0", (g["id"],))
+    pool = [u for u in users if u["user_id"] not in skip_ids]
+    random.SystemRandom().shuffle(pool)
+    req = await gw_required(g) if g["recheck"] else []
+    breq = await gw_boost_required(g) if g["recheck"] else []
+    need_b = g["min_boosts"] or 1
+    chosen = []
+    for u in pool:
+        if len(chosen) >= count:
+            break
+        if g["no_staff"] and await is_staff(u["user_id"], u["username"]):
+            continue
+        if req or breq:
+            if req and await gw_missing(bot, u["user_id"], req):
+                continue
+            if breq and await gw_boost_missing(bot, u["user_id"], breq, need_b):
+                continue
+            await asyncio.sleep(0.03)
+        chosen.append(u)
+    return chosen
+
+
+def gw_results_text(g, winners, total: int) -> str:
+    head = f"<b>Итоги розыгрыша: {esc(g['title'])}</b>\n\nУчастников: {total}\n"
+    if not winners:
+        return head + "\nПодходящих участников не нашлось, победителей нет."
+    lines = [f"{i}. {mention(w)}" for i, w in enumerate(winners, 1)]
+    return head + "\nПобедители:\n" + "\n".join(lines) + "\n\nПоздравляем!"
+
+
+async def gw_win_message(g) -> str:
+    if g["win_text"]:
+        return g["win_text"].replace("{title}", esc(g["title"]))
+    txt = f"Поздравляем! Вы стали победителем розыгрыша «{esc(g['title'])}»."
+    support = await get_setting("support_url")
+    if support:
+        return txt + f"\n\nЧтобы получить приз, свяжитесь с администратором: {esc(support)}"
+    return txt + "\n\nАдминистратор свяжется с вами в ближайшее время."
+
+
+async def gw_announce(bot: Bot, gid: int, dm: bool = True):
+    """Публикует итоги в канале, обновляет исходный пост, пишет победителям и отчитывается админу."""
+    g = await get_gw(gid)
+    winners = await fetchall("SELECT * FROM gw_winners WHERE giveaway_id=? ORDER BY place", (gid,))
+    total = await gw_count(gid)
+    problems, result_id = [], None
+    try:
+        msg = await bot.send_message(
+            chat_ref(g["channel"]), gw_results_text(g, winners, total),
+            reply_parameters=ReplyParameters(message_id=g["post_msg_id"], allow_sending_without_reply=True),
+            link_preview_options=NO_PREVIEW)
+        result_id = msg.message_id
+        await run("UPDATE giveaways SET result_msg_id=? WHERE id=?", (result_id, gid))
+    except Exception as e:
+        problems.append(f"не удалось опубликовать итоги в канале: {esc(str(e))}")
+    g = await get_gw(gid)
+    link = msg_link(g["channel"], result_id)
+    await gw_edit_post(bot, g, await gw_post_kb(bot, g, link))
+    failed = []
+    if dm:
+        text = await gw_win_message(g)
+        for w in winners:
+            try:
+                await bot.send_message(w["user_id"], text)
+                await run("UPDATE gw_winners SET notified=1 WHERE giveaway_id=? AND user_id=?", (gid, w["user_id"]))
+            except Exception:
+                failed.append(w)
+            await asyncio.sleep(0.05)
+    if g["admin_id"]:
+        report = f"Розыгрыш «{esc(g['title'])}» завершён.\nУчастников: {total}\n"
+        report += ("Победители:\n" + "\n".join(f"{i}. {mention(w)}" for i, w in enumerate(winners, 1))) if winners \
+            else "Победителей нет."
+        if failed:
+            report += "\n\nНе удалось написать в личку (свяжитесь сами):\n" + "\n".join(
+                f"{mention(w)} (id {w['user_id']})" for w in failed)
+        if problems:
+            report += "\n\nВнимание: " + "; ".join(problems) + "\nИтоги можно опубликовать заново в карточке розыгрыша."
+        try:
+            await bot.send_message(g["admin_id"], report)
+        except Exception:
+            pass
+
+
+async def finish_giveaway(bot: Bot, gid: int) -> bool:
+    cur = await db.execute("UPDATE giveaways SET status='finishing' WHERE id=? AND status='active'", (gid,))
+    await db.commit()
+    if cur.rowcount != 1:
+        return False
+    g = await get_gw(gid)
+    try:
+        chosen = await gw_pick(bot, g, g["winners"], set())
+        await run("DELETE FROM gw_winners WHERE giveaway_id=?", (gid,))
+        for i, u in enumerate(chosen, 1):
+            await run("INSERT INTO gw_winners(giveaway_id,user_id,place,username,name) VALUES(?,?,?,?,?)",
+                      (gid, u["user_id"], i, u["username"], u["name"]))
+        await run("UPDATE giveaways SET status='finished', finished=? WHERE id=?", (int(time.time()), gid))
+    except Exception:
+        logging.exception("Не удалось выбрать победителей розыгрыша #%s", gid)
+        await run("UPDATE giveaways SET status='active' WHERE id=?", (gid,))
+        return False
+    await gw_announce(bot, gid)
+    return True
+
+
+async def gw_reroll(bot: Bot, gid: int, old_uid: int):
+    """Заменяет победителя другим случайным участником. Возвращает (новый_победитель, ошибка)."""
+    g = await get_gw(gid)
+    old = await fetchone("SELECT * FROM gw_winners WHERE giveaway_id=? AND user_id=?", (gid, old_uid))
+    if not g or not old:
+        return None, "Победитель не найден"
+    current = {r["user_id"] for r in await fetchall("SELECT user_id FROM gw_winners WHERE giveaway_id=?", (gid,))}
+    chosen = await gw_pick(bot, g, 1, current)
+    if not chosen:
+        return None, "Подходящих участников больше нет"
+    u = chosen[0]
+    await run("UPDATE gw_users SET excluded=1 WHERE giveaway_id=? AND user_id=?", (gid, old_uid))
+    await run("DELETE FROM gw_winners WHERE giveaway_id=? AND user_id=?", (gid, old_uid))
+    await run("INSERT INTO gw_winners(giveaway_id,user_id,place,username,name) VALUES(?,?,?,?,?)",
+              (gid, u["user_id"], old["place"], u["username"], u["name"]))
+    winners = await fetchall("SELECT * FROM gw_winners WHERE giveaway_id=? ORDER BY place", (gid,))
+    if g["result_msg_id"]:
+        try:
+            await bot.edit_message_text(gw_results_text(g, winners, await gw_count(gid)), chat_id=chat_ref(g["channel"]),
+                                        message_id=g["result_msg_id"], link_preview_options=NO_PREVIEW)
+        except Exception as e:
+            logging.warning("Не удалось обновить итоги в канале: %s", e)
+    try:
+        await bot.send_message(u["user_id"], await gw_win_message(g))
+    except Exception:
+        pass
+    return u, None
+
+
+async def giveaway_tick(bot: Bot):
+    """Один проход: подводит итоги по истёкшим розыгрышам и обновляет счётчик участников на кнопке."""
+    for g in await fetchall("SELECT id FROM giveaways WHERE status='active' AND end_ts<=?", (int(time.time()),)):
+        await finish_giveaway(bot, g["id"])
+    for g in await fetchall("SELECT * FROM giveaways WHERE status='active' AND show_count=1 AND post_msg_id IS NOT NULL"):
+        n = await gw_count(g["id"])
+        if n != g["shown_count"]:
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_ref(g["channel"]), message_id=g["post_msg_id"],
+                                                    reply_markup=await gw_post_kb(bot, g))
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    logging.warning("Счётчик розыгрыша #%s: %s", g["id"], e)
+            await db.execute("UPDATE giveaways SET shown_count=? WHERE id=?", (n, g["id"]))
+            await db.commit()
+
+
+async def giveaway_loop(bot: Bot):
+    """Каждые 30 секунд проверяет розыгрыши (итоги и счётчики)."""
+    while True:
+        try:
+            await giveaway_tick(bot)
+        except Exception:
+            logging.exception("Ошибка в цикле розыгрышей")
+        await asyncio.sleep(GW_LOOP_SECONDS)
+
+
+# ───── участие (пользователь) ─────
+async def join_flow(msg: Message, u, gid: int, cb: CallbackQuery = None):
+    bot = msg.bot
+
+    async def out(text, markup=None, note=None):
+        if cb:
+            await show(cb, text, markup)
+            await cb.answer(note)
+        else:
+            await msg.answer(text, reply_markup=markup)
+
+    g = await get_gw(gid)
+    if not g or g["status"] == "draft":
+        return await out("Розыгрыш не найден.")
+    if g["status"] != "active":
+        rows = []
+        link = msg_link(g["channel"], g["result_msg_id"]) if g["status"] == "finished" else None
+        if link:
+            rows.append([ub("Итоги розыгрыша", link)])
+        rows.append([btn("В каталог", "menu")])
+        return await out("Этот розыгрыш отменён." if g["status"] == "cancelled" else "Этот розыгрыш уже завершён.", kb(rows))
+
+    title = esc(g["title"])
+    mine = await fetchone("SELECT joined FROM gw_users WHERE giveaway_id=? AND user_id=?", (gid, u.id))
+    if mine:
+        n = (await fetchone("SELECT COUNT(*) n FROM gw_users WHERE giveaway_id=? AND joined<=?", (gid, mine["joined"])))["n"]
+        return await out(f"Вы уже участвуете в розыгрыше «{title}».\nНомер участника: {n}\nИтоги: {fmt_ts(g['end_ts'])}",
+                         kb([[btn("В каталог", "menu")]]))
+
+    req = await gw_required(g)
+    missing = await gw_missing(bot, u.id, req) if req else []
+    breq = await gw_boost_required(g)
+    need_b = g["min_boosts"] or 1
+    bmissing = await gw_boost_missing(bot, u.id, breq, need_b) if breq else []
+    need_views = g["min_views"] or 0
+    done_views = await gw_views_done(u.id, g) if need_views else 0
+    if missing or bmissing or done_views < need_views:
+        missing_ids = {c["id"] for c in missing}
+        bhave = {c["id"]: have for c, have in bmissing}
+        lines = [f"Чтобы участвовать в розыгрыше «{title}», выполните условия:\n"]
+        for ch in req:
+            lines.append(f"Подписка на «{esc(ch['title'])}»: " + ("не выполнено" if ch["id"] in missing_ids else "выполнено"))
+        for ch in breq:
+            if ch["id"] in bhave:
+                lines.append(f"Буст канала «{esc(ch['title'])}»: не выполнено" + (f" ({bhave[ch['id']]} из {need_b})" if need_b > 1 else ""))
+            else:
+                lines.append(f"Буст канала «{esc(ch['title'])}»: выполнено")
+        if need_views:
+            lines.append(f"Открыть разных скриптов в боте: {min(done_views, need_views)} из {need_views}")
+        rows = [[ub(f"Подписаться: {ch['title']}", ch["url"])] for ch in missing if ch["url"]]
+        for ch, _ in bmissing:
+            link = boost_link(ch)
+            if link:
+                rows.append([ub(f"Забустить: {ch['title']}", link)])
+        if bmissing:
+            lines.append("\nБуст доступен пользователям Telegram Premium. После буста нажмите «Проверить условия».")
+        if done_views < need_views:
+            rows.append([btn("Открыть каталог", "cats")])
+        rows.append([btn("Проверить условия", f"gwchk:{gid}", style="success")])
+        return await out("\n".join(lines), kb(rows), note="Условия ещё не выполнены" if cb else None)
+
+    await run("INSERT OR IGNORE INTO gw_users(giveaway_id,user_id,username,name,joined) VALUES(?,?,?,?,?)",
+              (gid, u.id, u.username, (u.first_name or "")[:40], int(time.time())))
+    n = await gw_count(gid)
+    await out(f"Вы участвуете в розыгрыше «{title}».\nНомер участника: {n}\nИтоги: {fmt_ts(g['end_ts'])}",
+              kb([[btn("В каталог", "menu")]]), note="Вы участвуете")
+
+
+@user.callback_query(F.data.regexp(r"^gwchk:\d+$"))
+async def cb_gw_check(cb: CallbackQuery):
+    await join_flow(cb.message, cb.from_user, int(cb.data.split(":")[1]), cb)
+
+
+# ───── админка: карточка и список ─────
+def gw_mark(st: str) -> str:
+    return {"draft": "[черновик]", "active": "[идёт]", "finishing": "[итоги]",
+            "finished": "[завершён]", "cancelled": "[отменён]"}.get(st, "")
+
+
+async def gw_card(bot: Bot, gid: int):
+    g = await get_gw(gid)
+    if not g:
+        return None, None
+    n = await gw_count(gid)
+    req = await gw_required(g)
+    conds = []
+    if req:
+        conds.append("подписка на: " + ", ".join(esc(c["title"]) for c in req))
+    breq = await gw_boost_required(g)
+    if breq:
+        conds.append("буст канала: " + ", ".join(esc(c["title"]) for c in breq)
+                     + (f" (бустов: {g['min_boosts']})" if (g["min_boosts"] or 1) > 1 else ""))
+    if g["min_views"]:
+        conds.append(f"открыть минимум {g['min_views']} скриптов")
+    if g["extra"]:
+        conds.append(f"доп. условие: {esc(g['extra'])}")
+    st = g["status"]
+    lines = [f"<b>Розыгрыш #{gid}: {esc(g['title'])}</b>", f"Статус: {GW_STATUS.get(st, st)}",
+             f"Канал: {esc(g['channel']) if g['channel'] else 'не указан'}",
+             f"Победителей: {g['winners']}", f"Окончание: {fmt_ts(g['end_ts'])}", f"Участников: {n}",
+             "Условия: " + ("; ".join(conds) if conds else "нет"),
+             f"Кнопка: «{esc(g['btn_text'])}», цвет: {POST_STYLES.get(g['btn_style'] or '', 'обычная')}",
+             f"Картинка: {'есть' if g['photo'] else 'нет'}"]
+    if st == "finished":
+        winners = await fetchall("SELECT * FROM gw_winners WHERE giveaway_id=? ORDER BY place", (gid,))
+        lines.append("\nПобедители:\n" + ("\n".join(f"{i}. {mention(w)}" for i, w in enumerate(winners, 1)) if winners else "нет"))
+    edit_rows = [
+        [btn("Название", f"gwe:{gid}:title"), btn("Описание", f"gwe:{gid}:desc")],
+        [btn("Победители", f"gwe:{gid}:winners"), btn("Время окончания", f"gwe:{gid}:time")],
+        [btn("Условия", f"gwc:{gid}"), btn("Кнопка", f"gwb:{gid}")],
+        [btn("Дополнительно", f"gwo:{gid}")],
+    ]
+    if st == "draft":
+        rows = [[btn("Картинка", f"gwe:{gid}:photo"), btn("Канал", f"gwe:{gid}:channel")]] + edit_rows + [
+            [btn("Предпросмотр", f"gwprev:{gid}"), btn("Опубликовать", f"gwpub:{gid}", style="success")],
+            [btn("Удалить", f"gwdel:{gid}", style="danger")], [btn("К списку", "gw_list")]]
+    elif st == "active":
+        rows = [[btn(f"Участники ({n})", f"gwpart:{gid}")]] + edit_rows + [
+            [btn("Предпросмотр", f"gwprev:{gid}"), btn("Обновить пост", f"gwref:{gid}")],
+            [btn("Завершить сейчас", f"gwnow:{gid}", style="success"), btn("Отменить", f"gwcancel:{gid}", style="danger")],
+            [btn("К списку", "gw_list")]]
+    elif st == "finished":
+        rows = [[btn(f"Участники ({n})", f"gwpart:{gid}"), btn("Перевыбрать победителя", f"gwrr:{gid}")],
+                [btn("Опубликовать итоги заново", f"gwrepost:{gid}")],
+                [btn("Удалить", f"gwdel:{gid}", style="danger")], [btn("К списку", "gw_list")]]
+    else:
+        rows = [[btn("Удалить", f"gwdel:{gid}", style="danger")], [btn("К списку", "gw_list")]]
+    return "\n".join(lines), kb(rows)
+
+
+async def open_card(cb: CallbackQuery, gid: int, note: str = None):
+    text, markup = await gw_card(cb.bot, gid)
+    if text is None:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    await show(cb, text, markup)
+    await cb.answer(note)
+
+
+async def send_card(m: Message, gid: int):
+    text, markup = await gw_card(m.bot, gid)
+    if text:
+        await m.answer(text, reply_markup=markup)
+
+
+@adm3.callback_query(F.data.regexp(r"^(gw_list|gwl:\d+)$"))
+async def gw_list(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    items = await fetchall("SELECT id,title,status FROM giveaways ORDER BY id DESC")
+    rows = paginate(items, page_of(cb.data) if ":" in cb.data else 0, 8,
+                    lambda g: btn(f"{gw_mark(g['status'])} {g['title'][:28]}", f"gw:{g['id']}"), "gwl")
+    rows.append([btn("Создать розыгрыш", "gw_new", style="success")])
+    rows.append([btn("Назад", "adm")])
+    await show(cb, "<b>Розыгрыши</b>" + ("" if items else "\n\nПока нет ни одного."), kb(rows))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gw:\d+$"))
+async def gw_open(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await open_card(cb, int(cb.data.split(":")[1]))
+
+
+async def gw_ask(cb: CallbackQuery, state: FSMContext, gid: int, field: str, text: str, extra_rows=None):
+    await state.set_state(GwEdit.value)
+    await state.update_data(gid=gid, field=field)
+    rows = (extra_rows or []) + [[btn("Отмена", f"gw:{gid}" if gid else "gw_list")]]
+    await show(cb, text, kb(rows))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data == "gw_new")
+async def gw_new(cb: CallbackQuery, state: FSMContext):
+    await gw_ask(cb, state, 0, "new", "Введите название розыгрыша (оно будет заголовком поста):")
+
+
+GW_HINTS = {
+    "title": "Введите новое название розыгрыша:",
+    "desc": "Отправьте описание или приз (форматирование сохранится). «-» — убрать:",
+    "photo": "Отправьте картинку для поста (как фото). «-» — убрать:",
+    "winners": f"Сколько будет победителей? Отправьте число от 1 до {GW_MAX_WINNERS}:",
+    "time": f"Отправьте дату и время окончания в формате ДД.ММ.ГГГГ ЧЧ:ММ ({TZ_NAME}), например 25.12.2026 18:00.\nИли выберите срок от текущего момента:",
+    "extra": "Введите дополнительное условие текстом. Оно попадёт в пост, но бот его не проверяет. «-» — убрать:",
+    "minv": "Сколько разных скриптов нужно открыть в боте, чтобы участвовать? Число от 0 до 20 (0 — условие выключено):",
+    "minb": "Сколько бустов канала нужно от одного человека? Число от 1 до 10:",
+    "btntext": "Введите текст кнопки участия (до 30 символов):",
+    "wintext": "Введите сообщение победителю (можно использовать {title} для названия розыгрыша). «-» — стандартное:",
+    "channel": "Отправьте @username канала или его ID (-100...), куда выйдет пост. Бот должен быть админом канала:",
+}
+
+
+@adm3.callback_query(F.data.regexp(r"^gwe:\d+:(title|desc|photo|winners|time|extra|minv|minb|btntext|wintext|channel)$"))
+async def gw_edit_start(cb: CallbackQuery, state: FSMContext):
+    _, gid, field = cb.data.split(":")
+    gid = int(gid)
+    g = await get_gw(gid)
+    if not g:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    if g["status"] not in ("draft", "active"):
+        return await cb.answer("Завершённый розыгрыш изменить нельзя", show_alert=True)
+    if field in ("photo", "channel") and g["status"] != "draft":
+        return await cb.answer("Это можно менять только в черновике", show_alert=True)
+    extra = None
+    if field == "time":
+        extra = [[btn(label, f"gwq:{gid}:{mins}") for label, mins in GW_PRESETS[i:i + 3]] for i in range(0, len(GW_PRESETS), 3)]
+    await gw_ask(cb, state, gid, field, GW_HINTS[field], extra)
+
+
+@adm3.callback_query(F.data.regexp(r"^gwq:\d+:\d+$"))
+async def gw_quick_time(cb: CallbackQuery, state: FSMContext):
+    _, gid, mins = cb.data.split(":")
+    gid = int(gid)
+    g = await get_gw(gid)
+    if not g or g["status"] not in ("draft", "active"):
+        return await cb.answer("Нельзя изменить", show_alert=True)
+    await run("UPDATE giveaways SET end_ts=? WHERE id=?", (int(time.time()) + int(mins) * 60, gid))
+    await state.clear()
+    await gw_refresh_post(cb.bot, gid)
+    await open_card(cb, gid, "Время сохранено")
+
+
+@adm3.message(GwEdit.value, F.photo | F.text)
+async def gw_edit_msg(m: Message, state: FSMContext):
+    d = await state.get_data()
+    field, gid = d.get("field"), d.get("gid")
+    text = (m.text or "").strip()
+    now = int(time.time())
+    if field == "new":
+        if not text:
+            return await m.answer("Отправьте название текстом.")
+        ch = norm_channel(await get_setting("post_channel"))
+        gid = await run("INSERT INTO giveaways(title,end_ts,status,channel,created,admin_id) VALUES(?,?,?,?,?,?)",
+                        (text[:100], now + 86400, "draft", ch, now, m.from_user.id))
+        await state.clear()
+        return await send_card(m, gid)
+    g = await get_gw(gid) if gid else None
+    if not g or g["status"] not in ("draft", "active"):
+        await state.clear()
+        return await m.answer("Розыгрыш не найден или уже завершён.")
+    q, args = None, ()
+    if field == "photo":
+        if m.photo:
+            q, args = "photo=?", (m.photo[-1].file_id,)
+        elif text == "-":
+            q, args = "photo=?", (None,)
+        else:
+            return await m.answer("Отправьте картинку (как фото) или «-».")
+    else:
+        if not text:
+            return await m.answer("Отправьте текстом.")
+        if field == "title":
+            q, args = "title=?", (text[:100],)
+        elif field == "desc":
+            q, args = "description=?", ("" if text == "-" else to_html(m.text, m.entities).strip(),)
+        elif field == "winners":
+            if not text.isdigit() or not 1 <= int(text) <= GW_MAX_WINNERS:
+                return await m.answer(f"Нужно число от 1 до {GW_MAX_WINNERS}.")
+            q, args = "winners=?", (int(text),)
+        elif field == "time":
+            ts = parse_dt(text)
+            if ts is None:
+                return await m.answer(f"Не понял дату. Формат: ДД.ММ.ГГГГ ЧЧ:ММ ({TZ_NAME}), например 25.12.2026 18:00.")
+            if ts <= now + 60:
+                return await m.answer("Это время уже прошло или слишком близко. Укажите время в будущем.")
+            q, args = "end_ts=?", (ts,)
+        elif field == "extra":
+            q, args = "extra=?", ("" if text == "-" else text[:200],)
+        elif field == "minv":
+            if not text.isdigit() or int(text) > 20:
+                return await m.answer("Нужно число от 0 до 20.")
+            q, args = "min_views=?", (int(text),)
+        elif field == "minb":
+            if not text.isdigit() or not 1 <= int(text) <= 10:
+                return await m.answer("Нужно число от 1 до 10.")
+            q, args = "min_boosts=?", (int(text),)
+        elif field == "btntext":
+            if len(text) > 30:
+                return await m.answer("Слишком длинно: максимум 30 символов.")
+            q, args = "btn_text=?", (text,)
+        elif field == "wintext":
+            q, args = "win_text=?", ("" if text == "-" else to_html(m.text, m.entities).strip(),)
+        elif field == "channel":
+            ref = norm_channel(text)
+            try:
+                chat = await m.bot.get_chat(chat_ref(ref))
+            except Exception as e:
+                return await m.answer(f"Не нашёл канал: {esc(str(e))}\nДобавьте бота админом канала и повторите.")
+            q, args = "channel=?", (ref if ref.startswith("@") else str(chat.id),)
+        else:
+            return
+    await run(f"UPDATE giveaways SET {q} WHERE id=?", args + (gid,))
+    await state.clear()
+    await gw_refresh_post(m.bot, gid)
+    await send_card(m, gid)
+
+
+# ───── условия ─────
+async def gw_conditions_screen(cb: CallbackQuery, gid: int):
+    g = await get_gw(gid)
+    if not g:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    sub = {int(x) for x in (g["channels"] or "").split(",") if x.strip().isdigit()}
+    boost = {int(x) for x in (g["boost_channels"] or "").split(",") if x.strip().isdigit()}
+    chans = await fetchall("SELECT * FROM channels ORDER BY id")
+    rows = [[btn(("[x] " if c["id"] in sub else "[ ] ") + "Подписка: " + c["title"][:14], f"gwch:{gid}:{c['id']}"),
+             btn(("[x] " if c["id"] in boost else "[ ] ") + "Буст", f"gwbo:{gid}:{c['id']}")] for c in chans]
+    rows.append([btn(f"Минимум бустов: {g['min_boosts'] or 1}", f"gwe:{gid}:minb")])
+    rows.append([btn(f"Открыть скриптов в боте: {g['min_views']}", f"gwe:{gid}:minv")])
+    rows.append([btn("Дополнительное условие", f"gwe:{gid}:extra")])
+    rows.append([btn("Назад", f"gw:{gid}")])
+    note = "" if chans else "\n\nКаналов пока нет. Добавьте их в разделе «Обяз. подписка»."
+    await show(cb, "<b>Условия участия</b>\n\nДля каждого канала отметьте, нужна ли подписка и/или буст. "
+                   "Бот должен быть админом этих каналов, иначе он не сможет ничего проверить. "
+                   "Буст может сделать только пользователь с Telegram Premium." + note, kb(rows))
+
+
+@adm3.callback_query(F.data.regexp(r"^gwc:\d+$"))
+async def gw_conditions(cb: CallbackQuery):
+    await gw_conditions_screen(cb, int(cb.data.split(":")[1]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwch:\d+:\d+$"))
+async def gw_toggle_channel(cb: CallbackQuery):
+    _, gid, chid = cb.data.split(":")
+    gid, chid = int(gid), int(chid)
+    g = await get_gw(gid)
+    if not g or g["status"] not in ("draft", "active"):
+        return await cb.answer("Нельзя изменить", show_alert=True)
+    chosen = [int(x) for x in (g["channels"] or "").split(",") if x.strip().isdigit()]
+    chosen = [x for x in chosen if x != chid] if chid in chosen else chosen + [chid]
+    await run("UPDATE giveaways SET channels=? WHERE id=?", (",".join(map(str, chosen)), gid))
+    await gw_refresh_post(cb.bot, gid)
+    await gw_conditions_screen(cb, gid)
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwbo:\d+:\d+$"))
+async def gw_toggle_boost(cb: CallbackQuery):
+    _, gid, chid = cb.data.split(":")
+    gid, chid = int(gid), int(chid)
+    g = await get_gw(gid)
+    if not g or g["status"] not in ("draft", "active"):
+        return await cb.answer("Нельзя изменить", show_alert=True)
+    chosen = [int(x) for x in (g["boost_channels"] or "").split(",") if x.strip().isdigit()]
+    chosen = [x for x in chosen if x != chid] if chid in chosen else chosen + [chid]
+    await run("UPDATE giveaways SET boost_channels=? WHERE id=?", (",".join(map(str, chosen)), gid))
+    await gw_refresh_post(cb.bot, gid)
+    await gw_conditions_screen(cb, gid)
+    await cb.answer()
+
+
+# ───── кнопка ─────
+@adm3.callback_query(F.data.regexp(r"^gwb:\d+$"))
+async def gw_button(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    cur = g["btn_style"] or ""
+
+    def label(key, name):
+        return name + (" (выбрано)" if cur == key else "")
+
+    await show(cb, f"<b>Кнопка участия</b>\n\nТекст: {esc(g['btn_text'])}\nЦвет: {POST_STYLES.get(cur, 'обычная')}", kb([
+        [btn("Изменить текст", f"gwe:{gid}:btntext")],
+        [btn(label("", "Обычная"), f"gwcol:{gid}:none")],
+        [btn(label("primary", "Синяя"), f"gwcol:{gid}:primary", style="primary")],
+        [btn(label("success", "Зелёная"), f"gwcol:{gid}:success", style="success")],
+        [btn(label("danger", "Красная"), f"gwcol:{gid}:danger", style="danger")],
+        [btn("Назад", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwcol:\d+:(none|primary|success|danger)$"))
+async def gw_color(cb: CallbackQuery):
+    _, gid, val = cb.data.split(":")
+    gid = int(gid)
+    g = await get_gw(gid)
+    if not g or g["status"] not in ("draft", "active"):
+        return await cb.answer("Нельзя изменить", show_alert=True)
+    await run("UPDATE giveaways SET btn_style=? WHERE id=?", ("" if val == "none" else val, gid))
+    await gw_refresh_post(cb.bot, gid)
+    await gw_button(cb)
+
+
+# ───── дополнительные настройки ─────
+GW_TOGGLES = {"count": ("show_count", "Счётчик участников на кнопке"),
+              "recheck": ("recheck", "Проверять подписку при подведении итогов"),
+              "staff": ("no_staff", "Админы не могут выиграть")}
+
+
+@adm3.callback_query(F.data.regexp(r"^gwo:\d+$"))
+async def gw_options(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    rows = [[btn(f"{name}: {'ВКЛ' if g[col] else 'ВЫКЛ'}", f"gwt:{gid}:{key}")] for key, (col, name) in GW_TOGGLES.items()]
+    rows.append([btn("Сообщение победителю", f"gwe:{gid}:wintext")])
+    rows.append([btn("Назад", f"gw:{gid}")])
+    await show(cb, "<b>Дополнительные настройки</b>\n\nСообщение победителю приходит ему в личку, когда итоги подведены.",
+               kb(rows))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwt:\d+:(count|recheck|staff)$"))
+async def gw_toggle(cb: CallbackQuery):
+    _, gid, key = cb.data.split(":")
+    gid = int(gid)
+    g = await get_gw(gid)
+    if not g or g["status"] not in ("draft", "active"):
+        return await cb.answer("Нельзя изменить", show_alert=True)
+    col = GW_TOGGLES[key][0]
+    await run(f"UPDATE giveaways SET {col}=1-{col} WHERE id=?", (gid,))
+    if key == "count":
+        await gw_refresh_post(cb.bot, gid)
+    await gw_options(cb)
+
+
+# ───── предпросмотр, публикация ─────
+async def gw_validate(bot: Bot, g) -> list:
+    errs = []
+    if not g["channel"]:
+        errs.append("не указан канал для поста")
+    if g["end_ts"] <= int(time.time()) + 60:
+        errs.append("время окончания уже прошло или слишком близко")
+    text = await gw_render_post(g)
+    if g["photo"] and html_len(text) > 1024:
+        errs.append(f"текст поста слишком длинный для картинки: {html_len(text)} из 1024 символов "
+                    "(сократите описание или уберите картинку)")
+    if html_len(text) > 4000:
+        errs.append("текст поста слишком длинный")
+    if g["channel"]:
+        try:
+            member = await bot.get_chat_member(chat_ref(g["channel"]), bot.id)
+            if member.status not in ("administrator", "creator"):
+                errs.append("бот должен быть админом канала, куда выходит пост")
+            elif getattr(member, "can_post_messages", None) is False:
+                errs.append("у бота нет права публиковать сообщения в канале")
+        except Exception as e:
+            errs.append(f"не удалось проверить канал публикации: {e}")
+    seen = set()
+    for ch in (await gw_required(g)) + (await gw_boost_required(g)):
+        if ch["id"] in seen:
+            continue
+        seen.add(ch["id"])
+        try:
+            member = await bot.get_chat_member(chat_ref(ch["chat_id"]), bot.id)
+            if member.status not in ("administrator", "creator"):
+                errs.append(f"бот не админ в канале «{ch['title']}», проверить подписку или буст он не сможет")
+        except Exception:
+            errs.append(f"бот не видит канал «{ch['title']}», проверить подписку или буст он не сможет")
+    return errs
+
+
+@adm3.callback_query(F.data.regexp(r"^gwprev:\d+$"))
+async def gw_preview(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g:
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    try:
+        await gw_send_post(cb.bot, cb.message.chat.id, g)
+    except Exception as e:
+        return await cb.answer(f"Ошибка предпросмотра: {e}", show_alert=True)
+    await cb.answer("Предпросмотр отправлен")
+
+
+@adm3.callback_query(F.data.regexp(r"^gwpub:\d+$"))
+async def gw_publish_ask(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g or g["status"] != "draft":
+        return await cb.answer("Розыгрыш не найден", show_alert=True)
+    errs = await gw_validate(cb.bot, g)
+    if errs:
+        await show(cb, "<b>Пока нельзя опубликовать:</b>\n" + "\n".join("• " + esc(e) for e in errs),
+                   kb([[btn("Назад", f"gw:{gid}")]]))
+        return await cb.answer()
+    await show(cb, f"Опубликовать розыгрыш «{esc(g['title'])}» в {esc(g['channel'])}?\n"
+                   f"Итоги будут подведены {fmt_ts(g['end_ts'])} автоматически.",
+               kb([[btn("Опубликовать", f"gwpubyes:{gid}", style="success"), btn("Отмена", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwpubyes:\d+$"))
+async def gw_publish(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g or g["status"] != "draft":
+        return await cb.answer("Розыгрыш уже опубликован или не найден", show_alert=True)
+    errs = await gw_validate(cb.bot, g)
+    if errs:
+        return await cb.answer("Нельзя опубликовать: " + "; ".join(errs)[:180], show_alert=True)
+    try:
+        msg = await gw_send_post(cb.bot, chat_ref(g["channel"]), g)
+    except Exception as e:
+        return await cb.answer(f"Не удалось опубликовать: {e}"[:190], show_alert=True)
+    await run("UPDATE giveaways SET status='active', post_msg_id=?, started=?, shown_count=0 WHERE id=?",
+              (msg.message_id, int(time.time()), gid))
+    await open_card(cb, gid, "Розыгрыш опубликован")
+
+
+@adm3.callback_query(F.data.regexp(r"^gwref:\d+$"))
+async def gw_refresh_btn(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    await gw_refresh_post(cb.bot, gid)
+    await cb.answer("Пост обновлён")
+
+
+# ───── завершить, отменить, удалить ─────
+@adm3.callback_query(F.data.regexp(r"^gwnow:\d+$"))
+async def gw_finish_ask(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    await show(cb, "Завершить розыгрыш сейчас и выбрать победителей?",
+               kb([[btn("Да, завершить", f"gwnowyes:{gid}", style="success"), btn("Отмена", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwnowyes:\d+$"))
+async def gw_finish_now(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    await cb.answer("Подвожу итоги")
+    ok = await finish_giveaway(cb.bot, gid)
+    text, markup = await gw_card(cb.bot, gid)
+    if text:
+        await show(cb, text if ok else "Не получилось подвести итоги (розыгрыш уже завершён или идёт подсчёт).\n\n" + text, markup)
+
+
+@adm3.callback_query(F.data.regexp(r"^gwcancel:\d+$"))
+async def gw_cancel_ask(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    await show(cb, "Отменить розыгрыш? Пост в канале останется с пометкой «Розыгрыш отменён», кнопка пропадёт.",
+               kb([[btn("Да, отменить", f"gwcancelyes:{gid}", style="danger"), btn("Нет", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwcancelyes:\d+$"))
+async def gw_cancel(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    cur = await db.execute("UPDATE giveaways SET status='cancelled', finished=? WHERE id=? AND status='active'",
+                           (int(time.time()), gid))
+    await db.commit()
+    if cur.rowcount == 1:
+        g = await get_gw(gid)
+        await gw_edit_post(cb.bot, g, None)
+    await open_card(cb, gid, "Розыгрыш отменён" if cur.rowcount == 1 else "Уже нельзя отменить")
+
+
+@adm3.callback_query(F.data.regexp(r"^gwdel:\d+$"))
+async def gw_delete_ask(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    await show(cb, "Удалить розыгрыш вместе со списком участников?",
+               kb([[btn("Да, удалить", f"gwdelyes:{gid}", style="danger"), btn("Нет", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwdelyes:\d+$"))
+async def gw_delete(cb: CallbackQuery, state: FSMContext):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if g and g["status"] in ("active", "finishing"):
+        return await cb.answer("Сначала завершите или отмените розыгрыш", show_alert=True)
+    await run("DELETE FROM gw_users WHERE giveaway_id=?", (gid,))
+    await run("DELETE FROM gw_winners WHERE giveaway_id=?", (gid,))
+    await run("DELETE FROM giveaways WHERE id=?", (gid,))
+    await cb.answer("Удалено")
+    await gw_list(cb, state)
+
+
+# ───── участники, итоги ─────
+@adm3.callback_query(F.data.regexp(r"^gwpart:\d+$"))
+async def gw_participants(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    n = await gw_count(gid)
+    last = await fetchall("SELECT * FROM gw_users WHERE giveaway_id=? ORDER BY joined DESC LIMIT 15", (gid,))
+    lines = [f"{mention(u)}" for u in last]
+    await show(cb, f"<b>Участники</b>\nВсего: {n}\n\nПоследние:\n" + ("\n".join(lines) if lines else "никого нет"),
+               kb([[btn("Скачать список (txt)", f"gwexp:{gid}")], [btn("Назад", f"gw:{gid}")]]))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwexp:\d+$"))
+async def gw_export(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    rows = await fetchall("SELECT * FROM gw_users WHERE giveaway_id=? ORDER BY joined", (gid,))
+    if not rows:
+        return await cb.answer("Участников пока нет", show_alert=True)
+    out = "\n".join(f"{i}. id {u['user_id']} | {('@' + u['username']) if u['username'] else '-'} | {u['name'] or '-'} | "
+                    f"{fmt_ts(u['joined'])}" for i, u in enumerate(rows, 1))
+    await cb.message.answer_document(BufferedInputFile(out.encode("utf-8"), filename=f"giveaway_{gid}_participants.txt"),
+                                     caption=f"Участников: {len(rows)}")
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwrepost:\d+$"))
+async def gw_repost(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    g = await get_gw(gid)
+    if not g or g["status"] != "finished":
+        return await cb.answer("Нельзя", show_alert=True)
+    await gw_announce(cb.bot, gid, dm=False)
+    await cb.answer("Итоги опубликованы заново")
+
+
+@adm3.callback_query(F.data.regexp(r"^gwrr:\d+$"))
+async def gw_reroll_menu(cb: CallbackQuery):
+    gid = int(cb.data.split(":")[1])
+    winners = await fetchall("SELECT * FROM gw_winners WHERE giveaway_id=? ORDER BY place", (gid,))
+    if not winners:
+        return await cb.answer("Победителей нет", show_alert=True)
+    rows = [[btn(f"Заменить: {w['place']}. {('@' + w['username']) if w['username'] else (w['name'] or w['user_id'])}",
+                 f"gwrr1:{gid}:{w['user_id']}")] for w in winners]
+    rows.append([btn("Назад", f"gw:{gid}")])
+    await show(cb, "Кого заменить другим случайным участником? Заменённый человек больше не сможет выиграть в этом розыгрыше.",
+               kb(rows))
+    await cb.answer()
+
+
+@adm3.callback_query(F.data.regexp(r"^gwrr1:\d+:\d+$"))
+async def gw_reroll_do(cb: CallbackQuery):
+    _, gid, uid = cb.data.split(":")
+    u, err = await gw_reroll(cb.bot, int(gid), int(uid))
+    if err:
+        return await cb.answer(err, show_alert=True)
+    await open_card(cb, int(gid), f"Новый победитель: {u['username'] or u['name'] or u['user_id']}")
+
+
 # ═════════════════════════ ВЛАДЕЛЕЦ: АДМИНИСТРАТОРЫ ═════════════════════════
 ADMINS_HELP = (
     "Уровни доступа:\n"
@@ -2076,6 +3104,7 @@ async def main():
     filled = await fill_tokens()  # ссылки для уже существующих скриптов
     await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_scripts_token ON scripts(token)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_events_kind_ts ON events(kind, ts)")
+    await db.execute("UPDATE giveaways SET status='active' WHERE status='finishing'")  # недоподсчитанные заново
     await db.commit()
     if filled:
         logging.info("Выданы ссылки существующим скриптам: %s", filled)
@@ -2088,6 +3117,8 @@ async def main():
         logging.info("Авто-бэкап включён (чат %s)", BACKUP_CHAT_ID)
     else:
         logging.warning("BACKUP_CHAT_ID не задан: бэкап базы выключен")
+
+    spawn(giveaway_loop(bot))  # автоподведение итогов розыгрышей
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(Track())
